@@ -1,10 +1,13 @@
 from airflow import DAG
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.http.operators.http import HttpOperator
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.utils.task_group import TaskGroup
+from airflow.utils.trigger_rule import TriggerRule
 from airflow.models import Variable
 import pendulum
 import json
+import logging
 
 CITIES = {
     "Lviv": {"lat": "49.83", "lon": "24.02"},
@@ -15,23 +18,31 @@ CITIES = {
 }
 
 def _process_weather(ti, city_name):
-    info = ti.xcom_pull(task_ids=f"extract_data_{city_name}")
+    info = ti.xcom_pull(task_ids=f"{city_name}.extract_data")
     weather_data = info.get("data", [info.get("current", {})])[0]
-    return (
-        city_name,
-        weather_data.get("dt"),
-        weather_data.get("temp"),
-        weather_data.get("humidity"),
-        weather_data.get("clouds"),
-        weather_data.get("wind_speed")
-    )
+
+    return {
+        "city": city_name,
+        "timestamp": weather_data.get("dt"),
+        "temp": weather_data.get("temp"),
+        "humidity": weather_data.get("humidity"),
+        "clouds": weather_data.get("clouds"),
+        "wind_speed": weather_data.get("wind_speed")
+    }
+
+def _check_wind_speed(ti, city_name):
+    processed_data = ti.xcom_pull(task_ids=f"{city_name}.process_data")
+    wind_speed = processed_data["wind_speed"]
+    if wind_speed > 5.0:
+        return f"{city_name}.alert_load"
+    return f"{city_name}.normal_load"
 
 with DAG(
-        dag_id="weather_pipeline",
+        dag_id="weather_pipeline_v2",
         schedule="@daily",
-        start_date=pendulum.datetime(2026, 3, 25, tz="UTC"), # Зробимо відступ на пару днів назад
+        start_date=pendulum.datetime(2026, 3, 25, tz="UTC"),
         catchup=True,
-        max_active_runs=1 # Щоб не перевантажити API одночасно
+        max_active_runs=1
 ) as dag:
 
     # db_drop_table = SQLExecuteQueryOperator( # Можна використовувати, коли треба видалити попередню версію таблиці
@@ -44,55 +55,66 @@ with DAG(
         task_id="create_table_sqlite",
         conn_id="weather_conn",
         sql="""CREATE TABLE IF NOT EXISTS measures
-               (city VARCHAR(50),
-                timestamp TIMESTAMP,
-                temp FLOAT,
-                humidity INTEGER,
-                cloudiness INTEGER,
-                wind_speed FLOAT);""",
+               (city VARCHAR(50), timestamp TIMESTAMP, temp FLOAT,
+                humidity INTEGER, cloudiness INTEGER, wind_speed FLOAT);""",
     )
 
-    previous_inject = db_create  # Точка старту для ланцюжка
+    previous_group_end = db_create
 
     for city, coords in CITIES.items():
-        extract_data = HttpOperator(
-            task_id=f"extract_data_{city}",
-            http_conn_id="weather_import",
-            endpoint="data/3.0/onecall/timemachine",
-            data={
-                "appid": Variable.get("WEATHER_API_KEY"),
-                "lat": coords["lat"],
-                "lon": coords["lon"],
-                "dt": "{{ dag_run.logical_date.timestamp() | int }}",
-                "units": "metric"
-            },
-            method="GET",
-            response_filter=lambda x: json.loads(x.text),
-        )
+        with TaskGroup(group_id=city) as city_group:
 
-        process_data = PythonOperator(
-            task_id=f"process_data_{city}",
-            python_callable=_process_weather,
-            op_kwargs={"city_name": city}
-        )
+            extract = HttpOperator(
+                task_id="extract_data",
+                http_conn_id="weather_import",
+                endpoint="data/3.0/onecall/timemachine",
+                data={
+                    "appid": Variable.get("WEATHER_API_KEY"),
+                    "lat": coords["lat"],
+                    "lon": coords["lon"],
+                    "dt": "{{ dag_run.logical_date.timestamp() | int }}",
+                    "units": "metric"
+                },
+                method="GET",
+                response_filter=lambda x: json.loads(x.text),
+            )
 
-        inject_data = SQLExecuteQueryOperator(
-            task_id=f"inject_data_{city}",
-            conn_id="weather_conn",
-            sql=f"""
-            INSERT INTO measures (city, timestamp, temp, humidity, cloudiness, wind_speed)
-            VALUES (
-                '{{{{ ti.xcom_pull(task_ids='process_data_{city}')[0] }}}}',
-                {{{{ ti.xcom_pull(task_ids='process_data_{city}')[1] }}}},
-                {{{{ ti.xcom_pull(task_ids='process_data_{city}')[2] }}}},
-                {{{{ ti.xcom_pull(task_ids='process_data_{city}')[3] }}}},
-                {{{{ ti.xcom_pull(task_ids='process_data_{city}')[4] }}}},
-                {{{{ ti.xcom_pull(task_ids='process_data_{city}')[5] }}}}
-            );
-            """,
-        )
+            process = PythonOperator(
+                task_id="process_data",
+                python_callable=_process_weather,
+                op_kwargs={"city_name": city}
+            )
 
-        db_create >> extract_data >> process_data >> inject_data
+            branch = BranchPythonOperator(
+                task_id="branch_on_wind",
+                python_callable=_check_wind_speed,
+                op_kwargs={"city_name": city}
+            )
 
-        previous_inject >> inject_data
-        previous_inject = inject_data
+            alert_load = PythonOperator(
+                task_id="alert_load",
+                python_callable=lambda city_name: logging.info(f"!!! WIND ALERT IN {city_name} !!!"),
+                op_kwargs={"city_name": city}
+            )
+
+            normal_load = SQLExecuteQueryOperator(
+                task_id="normal_load",
+                conn_id="weather_conn",
+                trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+                sql=f"""
+                INSERT INTO measures (city, timestamp, temp, humidity, cloudiness, wind_speed)
+                VALUES ('{{{{ ti.xcom_pull(task_ids='{city}.process_data')['city'] }}}}',
+                        {{{{ ti.xcom_pull(task_ids='{city}.process_data')['timestamp'] }}}},
+                        {{{{ ti.xcom_pull(task_ids='{city}.process_data')['temp'] }}}},
+                        {{{{ ti.xcom_pull(task_ids='{city}.process_data')['humidity'] }}}},
+                        {{{{ ti.xcom_pull(task_ids='{city}.process_data')['clouds'] }}}},
+                        {{{{ ti.xcom_pull(task_ids='{city}.process_data')['wind_speed'] }}}});
+                """
+            )
+
+            extract >> process >> branch
+            branch >> [normal_load, alert_load]
+            alert_load >> normal_load
+
+        previous_group_end >> extract
+        previous_group_end = normal_load
