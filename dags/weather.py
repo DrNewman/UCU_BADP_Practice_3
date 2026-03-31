@@ -37,8 +37,18 @@ def _check_wind_speed(ti, city_name):
         return f"{city_name}.alert_load"
     return f"{city_name}.normal_load"
 
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 2,
+    'retry_delay': pendulum.duration(minutes=1),
+}
+
 with DAG(
         dag_id="weather_pipeline_v2",
+        default_args=default_args,
         schedule="@daily",
         start_date=pendulum.datetime(2026, 3, 25, tz="UTC"),
         catchup=True,
