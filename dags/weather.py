@@ -1,4 +1,5 @@
 from airflow import DAG
+from airflow.models.param import Param
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.http.operators.http import HttpOperator
 from airflow.operators.python import PythonOperator, BranchPythonOperator
@@ -20,7 +21,6 @@ CITIES = {
 def _process_weather(ti, city_name):
     info = ti.xcom_pull(task_ids=f"{city_name}.extract_data")
     weather_data = info.get("data", [info.get("current", {})])[0]
-
     return {
         "city": city_name,
         "timestamp": weather_data.get("dt"),
@@ -30,29 +30,33 @@ def _process_weather(ti, city_name):
         "wind_speed": weather_data.get("wind_speed")
     }
 
-def _check_wind_speed(ti, city_name):
+def _check_wind_speed(ti, city_name, **context):
     processed_data = ti.xcom_pull(task_ids=f"{city_name}.process_data")
     wind_speed = processed_data["wind_speed"]
-    if wind_speed > 5.0:
+
+    threshold = context['params']['wind_threshold']
+    if wind_speed > threshold:
         return f"{city_name}.alert_load"
     return f"{city_name}.normal_load"
 
 default_args = {
     'owner': 'airflow',
-    'depends_on_past': False,
-    'email_on_failure': False,
-    'email_on_retry': False,
     'retries': 2,
     'retry_delay': pendulum.duration(minutes=1),
 }
 
 with DAG(
-        dag_id="weather_pipeline_v2",
+        dag_id="weather_pipeline_v3",
         default_args=default_args,
         schedule="@daily",
-        start_date=pendulum.datetime(2026, 3, 25, tz="UTC"),
+        start_date=pendulum.datetime(2026, 4, 24, tz="UTC"),
         catchup=True,
-        max_active_runs=1
+        max_active_runs=1,
+        params={
+            "wind_threshold": Param(5.0, type="number", description="Wind speed threshold for alert"),
+            "units": Param("metric", type="string", enum=["metric", "imperial"])
+        },
+        render_template_as_native_obj=True # Дозволяє передавати типи (int/float) через Jinja
 ) as dag:
 
     # db_drop_table = SQLExecuteQueryOperator( # Можна використовувати, коли треба видалити попередню версію таблиці
@@ -83,7 +87,7 @@ with DAG(
                     "lat": coords["lat"],
                     "lon": coords["lon"],
                     "dt": "{{ dag_run.logical_date.timestamp() | int }}",
-                    "units": "metric"
+                    "units": "{{ params.units }}"
                 },
                 method="GET",
                 response_filter=lambda x: json.loads(x.text),
@@ -103,8 +107,8 @@ with DAG(
 
             alert_load = PythonOperator(
                 task_id="alert_load",
-                python_callable=lambda city_name: logging.info(f"!!! WIND ALERT IN {city_name} !!!"),
-                op_kwargs={"city_name": city}
+                python_callable=lambda city_name, threshold: logging.info(f"!!! ALERT IN {city_name}: Wind > {threshold} !!!"),
+                op_kwargs={"city_name": city, "threshold": "{{ params.wind_threshold }}"}
             )
 
             normal_load = SQLExecuteQueryOperator(
